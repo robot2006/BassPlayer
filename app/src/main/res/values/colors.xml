@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#121212</color>
+    <color name="card">#181818</color>
+    <color name="text">#FFFFFF</color>
+    <color name="subtext">#B3B3B3</color>
+    <color name="green">#1DB954</color>
+    <color name="green_bright">#1ED760</color>
+    <color name="black">#000000</color>
+    <color name="song_selected">#1F1DB954</color>
+    <color name="icon_bg">#121212</color>
+</resources>
