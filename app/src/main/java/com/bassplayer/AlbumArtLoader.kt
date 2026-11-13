@@ -43,11 +43,17 @@ object AlbumArtLoader {
         }
     }
 
-    fun bind(imageView: ImageView, song: Song, size: Int, callback: (() -> Unit)? = null) {
+    fun bind(
+        imageView: ImageView,
+        song: Song,
+        size: Int,
+        callback: (() -> Unit)? = null,
+        preserveAspectRatio: Boolean = false
+    ) {
         imageView.tag = song.id
         showPlaceholder(imageView)
         load(imageView.context, song, size) { bitmap ->
-            if (imageView.tag == song.id) showBitmap(imageView, bitmap)
+            if (imageView.tag == song.id) showBitmap(imageView, bitmap, preserveAspectRatio)
             callback?.invoke()
         }
     }
@@ -59,13 +65,17 @@ object AlbumArtLoader {
         imageView.setImageResource(R.drawable.ic_music_note)
     }
 
-    fun showBitmap(imageView: ImageView, bitmap: Bitmap?) {
+    fun showBitmap(imageView: ImageView, bitmap: Bitmap?, preserveAspectRatio: Boolean = false) {
         if (bitmap == null) {
             showPlaceholder(imageView)
             return
         }
         imageView.setPadding(0, 0, 0, 0)
-        imageView.scaleType = ImageView.ScaleType.CENTER_CROP
+        imageView.scaleType = if (preserveAspectRatio) {
+            ImageView.ScaleType.FIT_CENTER
+        } else {
+            ImageView.ScaleType.CENTER_CROP
+        }
         imageView.setImageBitmap(bitmap)
     }
 

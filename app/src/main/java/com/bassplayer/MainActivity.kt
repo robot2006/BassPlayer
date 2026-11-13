@@ -757,7 +757,7 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
         if (currentSongId != song.id) {
             currentSongId = song.id
             AlbumArtLoader.bind(nowCover, song, 320)
-            AlbumArtLoader.bind(bigCover, song, 1024)
+            AlbumArtLoader.bind(bigCover, song, 1024, preserveAspectRatio = true)
             hzText.text = "--.-- Hz"
             noteText.text = if (state.isPlaying) s("Elemzés...", "Analyzing...") else s("Megállítva", "Paused")
             visualizerView.reset()
