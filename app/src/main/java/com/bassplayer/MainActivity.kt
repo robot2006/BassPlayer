@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ComponentName
 import android.content.ContentUris
 import android.content.Context
+import android.content.ContentValues
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
@@ -25,7 +26,11 @@ import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import android.widget.CheckBox
+import android.widget.LinearLayout
+import android.widget.ScrollView
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.IntentSenderRequest
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -91,6 +96,11 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
     private var sortMode = SortMode.TITLE
     private var artistFilter: String? = null
     private var favoritesOnly = false
+    private var playbackScope = "all"
+    private var playbackArtist: String? = null
+    private lateinit var playbackScopeBtn: TextView
+    private lateinit var playlistsBtn: TextView
+    private val playlistStore by lazy { PlaylistStore(prefs) }
     private var isExpanded = false
 
     private val favorites = mutableSetOf<Long>()
@@ -99,6 +109,12 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
     }
 
     private val handler = Handler(Looper.getMainLooper())
+    private var pendingMetadataWrites: List<Pair<android.net.Uri, ContentValues>> = emptyList()
+    private val mediaWriteConsent = registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        if (result.resultCode == RESULT_OK) applyPendingMetadataWrites()
+        else Toast.makeText(this, s("A módosítási engedélyt elutasítottad.", "The edit permission was denied."), Toast.LENGTH_LONG).show()
+        pendingMetadataWrites = emptyList()
+    }
     private val audioManager by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
 
     private enum class SortMode {
@@ -163,7 +179,8 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
         songList.layoutManager = LinearLayoutManager(this)
         adapter = SongAdapter(
             onClick = { index -> playSong(index) },
-            onFavoriteClick = { song -> if (!isExpanded) toggleFavorite(song) }
+            onFavoriteClick = { song -> if (!isExpanded) toggleFavorite(song) },
+            onMoreClick = { song -> showSongActions(song) }
         )
         adapter?.setEnglish(isEnglish)
         songList.adapter = adapter
@@ -223,6 +240,8 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
 
         findViewById<ImageButton>(R.id.sortBtn).setOnClickListener { showSortDialog() }
         filterBtn.setOnClickListener { showArtistFilterDialog() }
+        playbackScopeBtn.setOnClickListener { showPlaybackScopeDialog() }
+        playlistsBtn.setOnClickListener { showPlaylistsDialog() }
         favoritesFilterBtn.setOnClickListener {
             favoritesOnly = !favoritesOnly
             applyFilters()
@@ -245,9 +264,52 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
         }
     }
 
+    override fun onRestoreInstanceState(savedInstanceState: Bundle) {
+        super.onRestoreInstanceState(savedInstanceState)
+        // Library filters are session-only. Android may restore view state when
+        // reopening a task, so explicitly start again with the full song list.
+        favoritesOnly = false
+        artistFilter = null
+        if (::searchInput.isInitialized && searchInput.text.isNotEmpty()) searchInput.text.clear()
+        if (::favoritesFilterBtn.isInitialized) updateFavoritesFilterButton()
+        if (::songList.isInitialized) applyFilters()
+    }
+
     override fun onResume() {
         super.onResume()
+        if (::searchInput.isInitialized) {
+            searchInput.post { clearSearchFocus() }
+        }
         if (isExpanded) startAnalyzer()
+    }
+
+    override fun onPause() {
+        if (::searchInput.isInitialized) clearSearchFocus()
+        super.onPause()
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN &&
+            ::searchInput.isInitialized && searchInput.hasFocus() &&
+            !touchIsInside(event.rawX, event.rawY, searchInput)
+        ) {
+            clearSearchFocus()
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
+    private fun touchIsInside(rawX: Float, rawY: Float, view: View): Boolean {
+        val location = IntArray(2)
+        view.getLocationOnScreen(location)
+        return rawX >= location[0] && rawX < location[0] + view.width &&
+            rawY >= location[1] && rawY < location[1] + view.height
+    }
+
+    private fun clearSearchFocus() {
+        if (!::searchInput.isInitialized) return
+        searchInput.clearFocus()
+        val inputMethod = getSystemService(INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
+        inputMethod?.hideSoftInputFromWindow(searchInput.windowToken, 0)
     }
 
     override fun onStop() {
@@ -265,6 +327,7 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
     }
 
     override fun onDestroy() {
+        favoritesOnly = false
         handler.removeCallbacksAndMessages(null)
         stopAnalyzer()
         super.onDestroy()
@@ -279,6 +342,9 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
             (getSystemService(INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)
                 ?.hideSoftInputFromWindow(searchInput.windowToken, 0)
         } else {
+            favoritesOnly = false
+            updateFavoritesFilterButton()
+            applyFilters()
             super.onBackPressed()
         }
     }
@@ -294,6 +360,8 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
         emptyState = findViewById(R.id.emptyState)
         emptyText = findViewById(R.id.emptyText)
         loading = findViewById(R.id.loading)
+        playbackScopeBtn = findViewById(R.id.playbackScopeBtn)
+        playlistsBtn = findViewById(R.id.playlistsBtn)
 
         playerPanel = findViewById(R.id.playerPanel)
         nowCover = findViewById(R.id.nowCover)
@@ -355,13 +423,14 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
         emptyState.visibility = View.GONE
 
         Thread {
-            val loaded = querySongs()
+            var loaded = querySongs()
             runOnUiThread {
                 masterSongs.clear()
                 masterSongs.addAll(loaded)
                 applyFilters()
                 loading.visibility = View.GONE
                 binder?.snapshot()?.let { applySnapshot(it) }
+                if (prefs.getBoolean("filename_auto_fill", false)) requestFilenameAutofill(masterSongs.toList())
             }
         }.start()
     }
@@ -381,7 +450,9 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
             MediaStore.Audio.Media.ALBUM,
             MediaStore.Audio.Media.ALBUM_ID,
             MediaStore.Audio.Media.DURATION,
-            MediaStore.Audio.Media.DATE_ADDED
+            MediaStore.Audio.Media.DATE_ADDED,
+            MediaStore.Audio.Media.DISPLAY_NAME,
+            "album_artist"
         )
         val selection = buildString {
             append("${MediaStore.Audio.Media.DURATION} > 3000")
@@ -403,6 +474,8 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
             val albumIdColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM_ID)
             val durationColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
             val dateColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED)
+            val fileNameColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
+            val albumArtistColumn = cursor.getColumnIndex("album_artist")
 
             while (cursor.moveToNext()) {
                 val duration = cursor.getLong(durationColumn)
@@ -412,11 +485,14 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
                 val title = cursor.getString(titleColumn)?.trim()
                     ?.takeIf { it.isNotEmpty() } ?: "Névtelen szám"
                 val rawArtist = cursor.getString(artistColumn)?.trim()
-                val artist = if (rawArtist.isNullOrEmpty() || rawArtist == "<unknown>") {
+                val artistMissing = rawArtist.isNullOrEmpty() || rawArtist == "<unknown>"
+                val artist = if (artistMissing) {
                     "Ismeretlen előadó"
                 } else {
                     rawArtist
                 }
+                val rawAlbumArtist = if (albumArtistColumn >= 0) cursor.getString(albumArtistColumn)?.trim() else null
+                val albumArtistMissing = rawAlbumArtist.isNullOrEmpty() || rawAlbumArtist == "<unknown>"
                 val album = cursor.getString(albumColumn)?.trim()
                     ?.takeIf { it.isNotEmpty() && it != "<unknown>" } ?: ""
                 val dateAdded = cursor.getLong(dateColumn)
@@ -430,7 +506,11 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
                         durationMs = duration,
                         albumId = cursor.getLong(albumIdColumn),
                         dateAdded = dateAdded,
-                        uri = ContentUris.withAppendedId(collection, id)
+                        uri = ContentUris.withAppendedId(collection, id),
+                        albumArtist = if (albumArtistMissing) artist else rawAlbumArtist.orEmpty(),
+                        artistMissing = artistMissing,
+                        fileName = cursor.getString(fileNameColumn) ?: title,
+                        albumArtistMissing = albumArtistMissing
                     )
                 )
             }
@@ -450,7 +530,7 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
                 song.title.lowercase(Locale.getDefault()).contains(query) ||
                 song.artist.lowercase(Locale.getDefault()).contains(query) ||
                 song.album.lowercase(Locale.getDefault()).contains(query)
-            matchesArtist && matchesFavorite && matchesQuery
+            matchesArtist && matchesFavorite && matchesQuery && matchesPlaybackScope(song)
         }
 
         val sorted = sortSongs(filtered)
@@ -508,6 +588,159 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
         subtitleText.text = if (isEnglish) "All $count songs · ${formatTotalDuration(totalMs)}" else "Összesen $count szám · ${formatTotalDuration(totalMs)}"
     }
 
+    private fun matchesPlaybackScope(song: Song): Boolean = when (playbackScope) {
+        "favorites" -> favorites.contains(song.id)
+        "artist" -> playbackArtist?.let { selected -> artistNames(song.artist).any { it.equals(selected, true) } } == true
+        else -> true
+    }
+
+    private fun showPlaybackScopeDialog() {
+        val choices = listOf(s("Minden szám", "All songs"), s("Csak kedvencek", "Favorites only"), s("Egy előadó", "One artist"))
+        val selected = when (playbackScope) { "favorites" -> 1; "artist" -> 2; else -> 0 }
+        showModernChoiceDialog(s("Lejátszási mód", "Playback scope"), choices, selected) { which ->
+            if (which == 2) {
+                val artists = masterSongs.flatMap { artistNames(it.artist) }.distinctBy { it.lowercase(Locale.ROOT) }.sorted()
+                if (artists.isEmpty()) return@showModernChoiceDialog
+                showSearchableArtistDialog(s("Előadó kiválasztása", "Choose artist"), artists, artists.indexOfFirst { it.equals(playbackArtist, true) }) { index ->
+                    playbackArtist = artists.getOrNull(index)
+                    playbackScope = "artist"
+                    persistPlaybackScope()
+                }
+            } else {
+                playbackScope = if (which == 1) "favorites" else "all"
+                playbackArtist = null
+                persistPlaybackScope()
+            }
+        }
+    }
+
+    private fun persistPlaybackScope() {
+        updatePlaybackScopeButton()
+        applyFilters()
+    }
+
+    private fun updatePlaybackScopeButton() {
+        playbackScopeBtn.text = when (playbackScope) {
+            "favorites" -> s("Lejátszás: kedvencek", "Play: favorites")
+            "artist" -> s("Lejátszás: ${playbackArtist.orEmpty()}", "Play: ${playbackArtist.orEmpty()}")
+            else -> s("Lejátszás: Minden szám", "Play: All songs")
+        }
+    }
+
+    private fun showPlaylistsDialog() {
+        val lists = playlistStore.all()
+        val options = mutableListOf(s("＋ Új lejátszási lista", "＋ New playlist"))
+        options += lists.map { it.name }
+        if (lists.isEmpty()) { showModernChoiceDialog(s("Lejátszási listák", "Playlists"), options, -1) { createPlaylist() }; return }
+        showModernChoiceDialog(s("Lejátszási listák", "Playlists"), options, -1) { index ->
+            if (index == 0) createPlaylist() else showPlaylistActions(lists[index - 1])
+        }
+    }
+
+    private fun createPlaylist() {
+        val input = EditText(this).apply { hint = s("Lista neve", "Playlist name") }
+        AlertDialog.Builder(this).setTitle(s("Új lejátszási lista", "New playlist")).setView(input)
+            .setNegativeButton(s("Mégse", "Cancel"), null)
+            .setPositiveButton(s("Létrehozás", "Create")) { _, _ ->
+                val name = input.text.toString().trim()
+                if (name.isNotEmpty()) {
+                    playlistStore.save(playlistStore.all() + LocalPlaylist(name, emptyList()))
+                    showPlaylistActions(LocalPlaylist(name, emptyList()))
+                }
+            }.show().also(::styleDialog)
+    }
+
+    private fun showPlaylistActions(list: LocalPlaylist) {
+        val options = listOf(s("Lejátszás", "Play"), s("Dalok szerkesztése", "Edit songs"), s("Átnevezés", "Rename"), s("Lista törlése", "Delete playlist"))
+        showModernChoiceDialog(list.name, options, -1) { index -> when (index) {
+            0 -> { val songs = list.songIds.mapNotNull { id -> masterSongs.find { it.id == id } }; if (songs.isNotEmpty()) binder?.playQueue(songs, 0) }
+            1 -> editPlaylistSongs(list)
+            2 -> renamePlaylist(list)
+            3 -> AlertDialog.Builder(this).setMessage(s("Törlöd ezt a lejátszási listát? A zenefájlok megmaradnak.", "Delete this playlist? Audio files will remain untouched."))
+                .setNegativeButton(s("Mégse", "Cancel"), null).setPositiveButton(s("Törlés", "Delete")) { _, _ -> playlistStore.save(playlistStore.all().filterNot { it.name == list.name }); showPlaylistsDialog() }.show()
+        } }
+    }
+
+    private fun editPlaylistSongs(list: LocalPlaylist) {
+        val selected = list.songIds.toMutableSet()
+        val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)) }
+        val scroll = ScrollView(this).apply { addView(panel) }
+        val boxes = mutableMapOf<Long, CheckBox>()
+        masterSongs.forEach { song ->
+            val box = CheckBox(this).apply { text = "${song.title} — ${song.artist}"; isChecked = song.id in selected; setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text)); buttonTintList = android.content.res.ColorStateList.valueOf(ContextCompat.getColor(this@MainActivity, R.color.green_bright)) }
+            boxes[song.id] = box; panel.addView(box)
+        }
+        AlertDialog.Builder(this).setTitle(list.name).setView(scroll).setNegativeButton(s("Mégse", "Cancel"), null)
+            .setPositiveButton(s("Mentés", "Save")) { _, _ ->
+                val ids = boxes.filterValues { it.isChecked }.keys.toList()
+                playlistStore.save(playlistStore.all().map { if (it.name == list.name) it.copy(songIds = ids) else it })
+            }.show().also(::styleDialog)
+    }
+
+    private fun renamePlaylist(list: LocalPlaylist) {
+        val input = EditText(this).apply { setText(list.name) }
+        AlertDialog.Builder(this).setTitle(s("Átnevezés", "Rename")).setView(input).setNegativeButton(s("Mégse", "Cancel"), null)
+            .setPositiveButton(s("Mentés", "Save")) { _, _ -> val name = input.text.toString().trim(); if (name.isNotEmpty()) playlistStore.save(playlistStore.all().map { if (it.name == list.name) it.copy(name = name) else it }) }.show()
+    }
+
+    private fun showSongActions(song: Song) {
+        showModernChoiceDialog(song.title, listOf(s("Metaadatok szerkesztése", "Edit metadata"), s("Lejátszás következőként", "Play next"), s("Hozzáadás lejátszási listához", "Add to playlist")), -1) { choice ->
+            when (choice) {
+                0 -> editMetadata(song)
+                1 -> {
+                    val localBinder = binder
+                    if (localBinder != null) {
+                        localBinder.playNext(song)
+                        Toast.makeText(this, s("Következőként lejátszandó", "Queued to play next"), Toast.LENGTH_SHORT).show()
+                    } else Toast.makeText(this, s("A lejátszó még nem áll készen.", "The player is not ready yet."), Toast.LENGTH_SHORT).show()
+                }
+                else -> addSongToPlaylist(song)
+            }
+        }
+    }
+
+    private fun addSongToPlaylist(song: Song) {
+        val lists = playlistStore.all()
+        if (lists.isEmpty()) { createPlaylist(); return }
+        showModernChoiceDialog(s("Hozzáadás listához", "Add to playlist"), lists.map { it.name }, -1) { index ->
+            val target = lists[index]
+            playlistStore.save(lists.map { if (it.name == target.name) it.copy(songIds = it.songIds + song.id) else it })
+            Toast.makeText(this, s("Hozzáadva", "Added"), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun editMetadata(song: Song) {
+        val fields = listOf(
+            s("Cím", "Title") to EditText(this).apply { setText(song.title) },
+            s("Előadók (; elválasztva)", "Artists (separate with ;)") to EditText(this).apply { setText(if (song.artistMissing) "" else song.artist) },
+            s("Album előadója", "Album artist") to EditText(this).apply { setText(song.albumArtist) },
+            s("Album", "Album") to EditText(this).apply { setText(song.album) }
+        )
+        val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), dp(8)) }
+        fields.forEach { (label, input) ->
+            panel.addView(TextView(this).apply {
+                text = label
+                textSize = 13f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.subtext))
+                setPadding(dp(2), dp(10), dp(2), dp(2))
+            })
+            input.hint = label
+            panel.addView(input)
+        }
+        AlertDialog.Builder(this).setTitle(s("Metaadatok", "Metadata")).setView(panel)
+            .setNegativeButton(s("Mégse", "Cancel"), null)
+            .setPositiveButton(s("Mentés", "Save")) { _, _ ->
+                val values = ContentValues().apply {
+                    put(MediaStore.Audio.Media.TITLE, fields[0].second.text.toString().trim())
+                    put(MediaStore.Audio.Media.ARTIST, fields[1].second.text.toString().trim())
+                    put(MediaStore.Audio.Media.ALBUM_ARTIST, fields[2].second.text.toString().trim())
+                    put(MediaStore.Audio.Media.ALBUM, fields[3].second.text.toString().trim())
+                }
+                requestMetadataWrite(listOf(song.uri to values))
+            }.show().also(::styleDialog)
+    }
+
     private fun updateFilterButton() {
         val color = if (artistFilter != null) {
             ContextCompat.getColor(this, R.color.green_bright)
@@ -546,10 +779,60 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
         options.addAll(artists)
         val selectedIndex = artistFilter?.let { selected -> artists.indexOfFirst { it.equals(selected, true) } + 1 } ?: 0
 
-        showModernChoiceDialog(s("Előadó szűrése", "Filter by artist"), options, selectedIndex) { which ->
+        showSearchableArtistDialog(s("Előadó szűrése", "Filter by artist"), options, selectedIndex) { which ->
             artistFilter = if (which == 0) null else artists[which - 1]
             applyFilters()
         }
+    }
+
+    private fun showSearchableArtistDialog(title: String, choices: List<String>, selected: Int, onChoose: (Int) -> Unit) {
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(8), dp(18), dp(10))
+        }
+        val search = EditText(this).apply {
+            hint = s("Előadó keresése…", "Search artists…")
+            setSingleLine(true)
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text))
+            setHintTextColor(ContextCompat.getColor(this@MainActivity, R.color.subtext))
+            background = ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_search)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+        }
+        panel.addView(search, LinearLayout.LayoutParams(-1, dp(44)).apply { bottomMargin = dp(8) })
+        val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val scroll = ScrollView(this).apply { addView(rows) }
+        panel.addView(scroll, LinearLayout.LayoutParams(-1, dp(360)))
+        val dialog = AlertDialog.Builder(this).setTitle(title).setView(panel)
+            .setNegativeButton(s("Bezárás", "Close"), null).create()
+
+        fun render(filter: String = "") {
+            rows.removeAllViews()
+            choices.forEachIndexed { index, label ->
+                if (filter.isNotBlank() && !label.contains(filter, ignoreCase = true)) return@forEachIndexed
+                val row = TextView(this).apply {
+                    text = if (index == selected) "✓   $label" else "     $label"
+                    textSize = 15f
+                    setTextColor(ContextCompat.getColor(this@MainActivity, if (index == selected) R.color.green_bright else R.color.text))
+                    setPadding(dp(14), dp(13), dp(14), dp(13))
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        cornerRadius = dp(14).toFloat()
+                        setColor(ContextCompat.getColor(this@MainActivity, if (index == selected) R.color.card else R.color.bg))
+                    }
+                    isClickable = true
+                    isFocusable = true
+                    setOnClickListener { dialog.dismiss(); onChoose(index) }
+                }
+                rows.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) })
+            }
+        }
+        render()
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = render(s?.toString().orEmpty())
+            override fun afterTextChanged(s: Editable?) = Unit
+        })
+        dialog.show()
+        styleDialog(dialog)
     }
 
     private fun showModernChoiceDialog(title: String, choices: List<String>, selected: Int, onChoose: (Int) -> Unit) {
@@ -601,8 +884,14 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
             }
         val meter = checkRow(s("Szubfrekvencia-mérő", "Bass frequency meter"), showBassMeter)
         val visual = checkRow(s("Vizualizátor", "Visualizer"), showVisualizer)
+        val filenameFill = checkRow(s("Hiányzó előadók felismerése fájlnévből", "Detect missing artists from filenames"), prefs.getBoolean("filename_auto_fill", false))
         panel.addView(meter)
         panel.addView(visual)
+        panel.addView(filenameFill)
+        panel.addView(android.widget.Button(this).apply {
+            text = s("Hiányzó metaadatok kitöltése…", "Fill missing metadata…")
+            setOnClickListener { showMetadataFillPreview() }
+        })
         val language = android.widget.TextView(this).apply {
             text = "${s("Nyelv", "Language")}: ${if (isEnglish) "English" else "Magyar"}  ›"
             textSize = 15f
@@ -619,7 +908,8 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
                     showVisualizer = visual.isChecked
                     prefs.edit().putString("app_language", appLanguage)
                         .putBoolean("show_bass_meter", showBassMeter)
-                        .putBoolean("show_visualizer", showVisualizer).apply()
+                        .putBoolean("show_visualizer", showVisualizer)
+                        .putBoolean("filename_auto_fill", filenameFill.isChecked).apply()
                     recreate()
                 }
             }
@@ -632,8 +922,10 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
                 showBassMeter = meter.isChecked
                 showVisualizer = visual.isChecked
                 prefs.edit().putBoolean("show_bass_meter", showBassMeter)
-                    .putBoolean("show_visualizer", showVisualizer).apply()
+                    .putBoolean("show_visualizer", showVisualizer)
+                    .putBoolean("filename_auto_fill", filenameFill.isChecked).apply()
                 updateAnalyzerVisibility()
+                if (filenameFill.isChecked) requestFilenameAutofill(masterSongs.toList())
             }
             .setNegativeButton(s("Mégse", "Cancel"), null)
             .create()
@@ -648,6 +940,128 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
         })
     }
 
+    private fun showMetadataFillPreview() {
+        val candidates = masterSongs.mapNotNull { song ->
+            val parsed = FilenameMetadataParser.parse(song.fileName) ?: return@mapNotNull null
+            val artist = parsed.artist.takeIf { song.artistMissing }
+            val albumArtist = parsed.albumArtist.takeIf { song.albumArtistMissing }
+            if (artist == null && albumArtist == null) null else Triple(song, artist, albumArtist)
+        }
+        if (candidates.isEmpty()) {
+            Toast.makeText(this, s("Nincs hiányzó, felismerhető előadómező.", "No missing artist fields could be inferred."), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val preview = candidates.joinToString("\n\n") { (song, artist, albumArtist) ->
+            "${song.title}\n${artist?.let { "${s("Előadók", "Artists")}: $it" } ?: ""}${if (artist != null && albumArtist != null) "\n" else ""}${albumArtist?.let { "${s("Album előadója", "Album artist")}: $it" } ?: ""}"
+        }
+        AlertDialog.Builder(this).setTitle(s("Előnézet · ${candidates.size} szám", "Preview · ${candidates.size} songs"))
+            .setMessage(preview).setNegativeButton(s("Mégse", "Cancel"), null)
+            .setPositiveButton(s("Üresek kitöltése", "Fill empty fields")) { _, _ ->
+                val writes = candidates.map { (song, artist, albumArtist) ->
+                    song.uri to ContentValues().apply {
+                        artist?.let { put(MediaStore.Audio.Media.ARTIST, it) }
+                        albumArtist?.let { put(MediaStore.Audio.Media.ALBUM_ARTIST, it) }
+                    }
+                }
+                requestMetadataWrite(writes)
+            }.show().also(::styleDialog)
+    }
+
+    private fun requestFilenameAutofill(songs: List<Song>) {
+        val writes = songs.mapNotNull { song ->
+            val parsed = FilenameMetadataParser.parse(song.fileName) ?: return@mapNotNull null
+            if (!song.artistMissing && !song.albumArtistMissing) return@mapNotNull null
+            song.uri to ContentValues().apply {
+                if (song.artistMissing) put(MediaStore.Audio.Media.ARTIST, parsed.artist)
+                if (song.albumArtistMissing) put(MediaStore.Audio.Media.ALBUM_ARTIST, parsed.albumArtist)
+            }
+        }
+        if (writes.isNotEmpty()) requestMetadataWrite(writes)
+    }
+
+    private fun requestMetadataWrite(writes: List<Pair<android.net.Uri, ContentValues>>) {
+        if (writes.isEmpty()) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                pendingMetadataWrites = writes
+                val request = MediaStore.createWriteRequest(contentResolver, writes.map { it.first })
+                mediaWriteConsent.launch(IntentSenderRequest.Builder(request.intentSender).build())
+            } catch (_: Exception) {
+                pendingMetadataWrites = emptyList()
+                Toast.makeText(this, s("Nem sikerült engedélyt kérni a metaadatok módosításához.", "Could not request permission to edit metadata."), Toast.LENGTH_LONG).show()
+            }
+        } else {
+            pendingMetadataWrites = writes
+            applyPendingMetadataWrites()
+        }
+    }
+
+    private fun applyPendingMetadataWrites() {
+        var updated = 0
+        var failed = 0
+        pendingMetadataWrites.forEach { (uri, values) ->
+            try {
+                val writtenToFile = if (isMp3(uri)) writeMp3Tags(uri, values) else false
+                if (writtenToFile) {
+                    updated++
+                    contentResolver.notifyChange(uri, null)
+                    requestMediaRescan(uri)
+                } else {
+                    val id = uri.lastPathSegment
+                    val count = contentResolver.update(uri, values, "${MediaStore.Audio.Media._ID} = ?", arrayOf(id))
+                    if (count > 0 || metadataMatches(uri, values)) updated++ else failed++
+                }
+            } catch (_: Exception) { failed++ }
+        }
+        if (updated > 0) handler.postDelayed({ loadSongs() }, 1200)
+        Toast.makeText(this, if (failed == 0) s("Metaadatok frissítve: $updated", "Metadata updated: $updated") else s("Frissítve: $updated · nem módosult: $failed", "Updated: $updated · unchanged: $failed"), Toast.LENGTH_LONG).show()
+    }
+
+    private fun isMp3(uri: android.net.Uri): Boolean = try {
+        contentResolver.query(uri, arrayOf(MediaStore.Audio.Media.DISPLAY_NAME, MediaStore.Audio.Media.MIME_TYPE), null, null, null)?.use { cursor ->
+            cursor.moveToFirst() && (
+                cursor.getString(0)?.endsWith(".mp3", ignoreCase = true) == true ||
+                    cursor.getString(1)?.equals("audio/mpeg", ignoreCase = true) == true
+                )
+        } == true
+    } catch (_: Exception) { false }
+
+    private fun writeMp3Tags(uri: android.net.Uri, values: ContentValues): Boolean {
+        val fields = buildMap {
+            values.getAsString(MediaStore.Audio.Media.ARTIST)?.let { put("artist", it) }
+            values.getAsString(MediaStore.Audio.Media.ALBUM_ARTIST)?.let { put("album_artist", it) }
+            values.getAsString(MediaStore.Audio.Media.TITLE)?.let { put("title", it) }
+            values.getAsString(MediaStore.Audio.Media.ALBUM)?.let { put("album", it) }
+        }
+        if (fields.isEmpty()) return false
+        val original = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return false
+        val updatedBytes = Mp3Id3Editor.update(original, Mp3Id3Editor.fields(fields)) ?: return false
+        contentResolver.openOutputStream(uri, "wt")?.use { output -> output.write(updatedBytes); output.flush() } ?: return false
+        return true
+    }
+
+    private fun requestMediaRescan(uri: android.net.Uri) {
+        try {
+            val path = contentResolver.query(uri, arrayOf(MediaStore.Audio.Media.DATA), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }
+            if (!path.isNullOrBlank()) android.media.MediaScannerConnection.scanFile(this, arrayOf(path), null, null)
+        } catch (_: Exception) { }
+    }
+
+    private fun metadataMatches(uri: android.net.Uri, values: ContentValues): Boolean {
+        val columns = values.keySet().toTypedArray()
+        return try {
+            contentResolver.query(uri, columns, null, null, null)?.use { cursor ->
+                if (!cursor.moveToFirst()) return false
+                columns.all { column ->
+                    val index = cursor.getColumnIndex(column)
+                    index >= 0 && cursor.getString(index) == values.getAsString(column)
+                }
+            } == true
+        } catch (_: Exception) { false }
+    }
+
     private fun applyLocalizedUi() {
         if (!::searchInput.isInitialized) return
         searchInput.hint = s("Keresés...", "Search...")
@@ -658,6 +1072,8 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
         findViewById<ImageButton>(R.id.sortBtn).contentDescription = s("Rendezés", "Sort")
         findViewById<ImageButton>(R.id.filterBtn).contentDescription = s("Előadó szűrése", "Filter artists")
         findViewById<ImageButton>(R.id.favoritesFilterBtn).contentDescription = s("Csak kedvencek", "Favorites only")
+        if (::playbackScopeBtn.isInitialized) updatePlaybackScopeButton()
+        if (::playlistsBtn.isInitialized) playlistsBtn.text = s("Lejátszási listák", "Playlists")
         updateAnalyzerVisibility()
     }
 
@@ -672,13 +1088,14 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private fun artistNames(raw: String): List<String> = raw.split(Regex("\\s*[;,/&]\\s*|\\s+feat\\.?\\s+|\\s+ft\\.?\\s+", RegexOption.IGNORE_CASE))
+    private fun artistNames(raw: String): List<String> = raw.split(Regex("\\s*[;,/&]\\s*|\\s+X\\s+|\\s+feat\\.?\\s+|\\s+ft\\.?\\s+", RegexOption.IGNORE_CASE))
         .map { it.trim() }.filter { it.isNotEmpty() && !it.equals("Unknown artist", true) }
 
     private fun startPlaybackFromList() {
         if (binder == null || masterSongs.isEmpty()) return
         // A teljes könyvtár megy sorban, nem csak a szűrt találatok.
-        val queue = sortSongs(masterSongs)
+        val queue = sortSongs(masterSongs.filter(::matchesPlaybackScope))
+        if (queue.isEmpty()) { Toast.makeText(this, s("Nincs lejátszható szám ebben a módban.", "No songs are available in this playback mode."), Toast.LENGTH_SHORT).show(); return }
         val target = queue.indexOfFirst { it.id == currentSongId }
             .takeIf { it >= 0 } ?: 0
         binder?.playQueue(queue, target)
@@ -695,7 +1112,8 @@ class MainActivity : AppCompatActivity(), PlaybackService.Listener {
         }
         // Keresés/szűrés után is a teljes könyvtár legyen a lejátszási sor,
         // a kiválasztott szám pozíciójától, hogy a "következő" vigye tovább.
-        val queue = sortSongs(masterSongs)
+        val queue = sortSongs(masterSongs.filter(::matchesPlaybackScope))
+        if (queue.isEmpty()) { Toast.makeText(this, s("Nincs lejátszható szám ebben a módban.", "No songs are available in this playback mode."), Toast.LENGTH_SHORT).show(); return }
         val target = queue.indexOfFirst { it.id == song.id }.takeIf { it >= 0 } ?: 0
         localBinder.playQueue(queue, target)
     }

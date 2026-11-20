@@ -21,9 +21,9 @@ import kotlin.math.round
  *  - Blackman-ablak (alpha = 0.16)
  *  - magnitúdó 1/fftSize normalizálással, dB = 20*log10(mag)
  *  - minBin = floor(25 * fftSize / sampleRate)
- *  - maxBin = floor(120 * fftSize / sampleRate)
+ *  - maxBin = floor(100 * fftSize / sampleRate)
  *  - csúcs > -58 dB, parabolikus interpoláció,
- *    elfogadás 20..140 Hz, 5 mintás medián, HUD max 100 ms-onként
+ *    elfogadás 20..100 Hz, 5 mintás medián, HUD max 100 ms-onként
  *  - 30 fps (mint a HTML VIZ_INTERVAL = 1000/30)
  */
 class SpectrumAnalyzer(
@@ -35,9 +35,9 @@ class SpectrumAnalyzer(
         private const val FFT_SIZE = 8192
         private const val HALF = FFT_SIZE / 2
         private const val MIN_HZ = 25.0
-        private const val MAX_HZ = 120.0
+        private const val MAX_HZ = 100.0
         private const val ACCEPT_MIN = 20.0
-        private const val ACCEPT_MAX = 140.0
+        private const val ACCEPT_MAX = 100.0
         private const val THRESHOLD_DB = -58.0
         private const val SMOOTHING = 0.8
         private const val HISTORY = 5

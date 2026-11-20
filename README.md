@@ -26,7 +26,10 @@ BassPlayer plays music stored on your Android device. It works offline and has n
 - Filter by artist, including tracks with multiple artists.
 - Sort by title, artist, album, date added, or duration.
 - Favorites, shuffle, repeat, seeking, and background playback controls.
+- Choose to play the full library, favorites, or one artist; create and edit local playlists, and queue a song to play next.
+- Edit track metadata or optionally fill missing artist fields from filenames. Existing metadata is kept; cover art is not edited.
 - Live spectrum visualizer and optional bass-frequency meter.
+- The bass-frequency meter is limited to 100 Hz.
 - Hungarian and English interface. The initial language follows the device language and your choice is remembered.
 - No microphone permission and no network permission.
 
@@ -65,6 +68,10 @@ BassPlayer is licensed under the [MIT License](LICENSE).
 A BassPlayer a telefonodon tárolt zenéket játssza le. Offline működik, nincs benne reklám, analitika vagy telemetria. A release APK mérete körülbelül **4,6 MB**.
 
 ### Funkciók
+
+- Lejátszás a teljes könyvtárból, csak kedvencekből vagy egy előadótól; helyi lejátszási listák létrehozása és szerkesztése, valamint szám sorba állítása következőként.
+- Metaadatok kézi szerkesztése, vagy a hiányzó előadók kitöltése a fájlnév alapján. A meglévő metaadatok megmaradnak; a borítókép nem módosul.
+- A szubfrekvencia-mérő legfeljebb 100 Hz-et jelez.
 
 - Helyi zenék böngészése és keresése.
 - Szűrés előadóra; a közös előadós számok mindegyik érintett előadónál megjelennek.

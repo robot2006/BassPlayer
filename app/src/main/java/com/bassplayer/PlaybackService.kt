@@ -65,6 +65,8 @@ class PlaybackService : Service(), AudioManager.OnAudioFocusChangeListener {
             this@PlaybackService.playQueue(items, startIndex)
         }
 
+        fun playNext(song: Song) = this@PlaybackService.playNext(song)
+
         fun toggle() = this@PlaybackService.toggle()
 
         fun next() = this@PlaybackService.skip(1)
@@ -279,6 +281,32 @@ class PlaybackService : Service(), AudioManager.OnAudioFocusChangeListener {
         queue = items.toList()
         index = startIndex.coerceIn(items.indices)
         prepareQueue()
+    }
+
+    fun playNext(song: Song) {
+        if (queue.isEmpty()) {
+            playQueue(listOf(song), 0)
+            return
+        }
+        val insertAt = (index + 1).coerceIn(0, queue.size)
+        val updatedQueue = queue.toMutableList().apply { add(insertAt, song) }
+        queue = updatedQueue
+        val currentPlayer = player
+        if (currentPlayer == null) {
+            prepareQueue()
+            return
+        }
+        val item = MediaItem.Builder().setUri(song.uri).setMediaId(song.id.toString()).build()
+        currentPlayer.addMediaItem(insertAt, item)
+        if (shuffleEnabled) {
+            val order = buildList {
+                add(index)
+                add(insertAt)
+                for (itemIndex in updatedQueue.indices) if (itemIndex != index && itemIndex != insertAt) add(itemIndex)
+            }.toIntArray()
+            currentPlayer.setShuffleOrder(ShuffleOrder.DefaultShuffleOrder(order, System.nanoTime()))
+        }
+        notifyState()
     }
 
     fun toggle() {

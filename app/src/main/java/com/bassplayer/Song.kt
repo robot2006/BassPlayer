@@ -12,7 +12,11 @@ data class Song(
     val durationMs: Long,
     val albumId: Long,
     val dateAdded: Long,
-    val uri: Uri
+    val uri: Uri,
+    val albumArtist: String = artist,
+    val artistMissing: Boolean = false,
+    val fileName: String = title,
+    val albumArtistMissing: Boolean = false
 ) : Parcelable {
 
     override fun describeContents(): Int = 0
@@ -26,6 +30,10 @@ data class Song(
         dest.writeLong(albumId)
         dest.writeLong(dateAdded)
         dest.writeParcelable(uri, flags)
+        dest.writeString(albumArtist)
+        dest.writeInt(if (artistMissing) 1 else 0)
+        dest.writeString(fileName)
+        dest.writeInt(if (albumArtistMissing) 1 else 0)
     }
 
     companion object {
@@ -39,7 +47,11 @@ data class Song(
                 durationMs = parcel.readLong(),
                 albumId = parcel.readLong(),
                 dateAdded = parcel.readLong(),
-                uri = parcel.readParcelable(Uri::class.java.classLoader) ?: Uri.EMPTY
+                uri = parcel.readParcelable(Uri::class.java.classLoader) ?: Uri.EMPTY,
+                albumArtist = parcel.readString().orEmpty(),
+                artistMissing = parcel.readInt() != 0,
+                fileName = parcel.readString().orEmpty(),
+                albumArtistMissing = parcel.readInt() != 0
             )
 
             override fun newArray(size: Int): Array<Song?> = arrayOfNulls(size)

@@ -12,7 +12,8 @@ import java.util.Locale
 
 class SongAdapter(
     private val onClick: (Int) -> Unit,
-    private val onFavoriteClick: (Song) -> Unit
+    private val onFavoriteClick: (Song) -> Unit,
+    private val onMoreClick: (Song) -> Unit
 ) : RecyclerView.Adapter<SongAdapter.SongHolder>() {
 
     private var items: List<Song> = emptyList()
@@ -99,6 +100,7 @@ class SongAdapter(
         holder.favorite.setOnClickListener { onFavoriteClick(song) }
 
         holder.root.setOnClickListener { onClick(position) }
+        holder.root.setOnLongClickListener { onMoreClick(song); true }
     }
 
     private fun formatTime(ms: Long): String {
